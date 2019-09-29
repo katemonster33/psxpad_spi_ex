@@ -29,12 +29,14 @@
 #include <linux/types.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
-
+/*
 #ifdef CONFIG_ARCH_MULTI_V7
 #define BCM2708_PERI_BASE 0x3F000000
 #else
 #define BCM2708_PERI_BASE 0x20000000
 #endif
+*/
+#define BCM2708_PERI_BASE 0xFE000000 //RPi 4
 
 #define GPIO_BASE                (BCM2708_PERI_BASE + 0x200000) /* GPIO controller */
 
@@ -54,12 +56,12 @@
 #define PSX_ACK_OR_DIE if(!psxpad_wait_ack()) { GPIO_SET = pin; udelay(40); return 0; }
 
 #define PSX_GPIO_ACK 25
-#define PSX_GPIO_ATT1 8
-#define PSX_GPIO_ATT2 7
+#define PSX_GPIO_ATT1 23
+#define PSX_GPIO_ATT2 24
 
 static const char *psx_name = "PSX controller";
 
-#define PSX_REFRESH_TIME	HZ/100
+#define PSX_REFRESH_TIME	HZ/60
 
 /* PlayStation 1/2 joypad command and response are LSBFIRST. */
 
@@ -82,6 +84,7 @@ static const u8 PSX_CMD_ENABLE_MOTOR[]	= {
 
 struct psxpad {
 	struct input_dev *dev;
+	u8 dev_reg;
 	u8 type;
 	char phys[32];
 	bool motor1enable;
@@ -99,8 +102,6 @@ struct psxdriver {
 	u8 response[50] ____cacheline_aligned;
 };
 
-static struct psxdriver *psx_base = NULL;
-
 static volatile unsigned *gpio = NULL;
 
 /*
@@ -115,6 +116,7 @@ static int psx_xmit(struct spi_device *spi, const u8 *inBytes, u8 *outBytes, u8 
                 .rx_buf         = outBytes,
                 .len            = len,
                 .speed_hz       = baud_override,
+		.delay_usecs	= 0
         };
         int err;
 	u8 index;
@@ -165,9 +167,11 @@ static int psxpad_wait_ack(void)
  */
 static int psxpad_command(struct psxdriver *psx, const u8 sendcmdlen, u8 pin_num)
 {
+	unsigned long flags;
         int numBytesRecvd = 0;
 	u8 num_pad_bytes = 8;
 	int mtap;
+	u8 ack_seen = 0;
         u8 mode = 0;
         const u8 wakeup = 0x80;//0x01;
         const u8 read_mode = 0x42;
@@ -175,29 +179,44 @@ static int psxpad_command(struct psxdriver *psx, const u8 sendcmdlen, u8 pin_num
         int pin = 1 << (pin_num == 0 ? PSX_GPIO_ATT1 : PSX_GPIO_ATT2);
         if(!sendcmdlen)
                 return 0;
+	local_irq_save(flags);
 
         mode = psx->sendbuf[0];
         GPIO_CLR = pin;
 
         udelay(100); // waiting 100 us after pulling ATT low is key to multitap support
 
-        if(!psx_xmit(psx->spi, &wakeup, psx->response, 1, 0))
+        if(psx_xmit(psx->spi, &wakeup, psx->response, 1, 0))
         {
                 GPIO_SET = pin;
+		local_irq_restore(flags);
                 return -1;
         }
-	PSX_ACK_OR_DIE;
-        numBytesRecvd++;
+	for(index = 0; index < 50; index++)
+        {
+                udelay(1);
+                if(!(GPIO_STATUS & (1 << PSX_GPIO_ACK)))
+                {
+			ack_seen = 1; // saw ack... keep waiting though. need to wait 50 us
+                }
+        }
 
+        numBytesRecvd++;
         psx_xmit(psx->spi, psx->sendbuf, psx->response + numBytesRecvd, 1, 0);
         numBytesRecvd++;
+	if(psx->response[1] == 0xFF)
+	{
+		local_irq_restore(flags);
+		return 0;
+	}
 
-        if(psx->response[1] & 0x80) // multitap
+        if(psx->response[1] == 0x80) // multitap
         {
 		PSX_ACK_OR_DIE;
-                if(!psx_xmit(psx->spi, &wakeup, psx->response + numBytesRecvd, 1, 2000000))
+                if(psx_xmit(psx->spi, &wakeup, psx->response + numBytesRecvd, 1, 2000000))
                 {
                         GPIO_SET = pin;
+			local_irq_restore(flags);
 			return -1;
                 }
 		PSX_ACK_OR_DIE;
@@ -213,7 +232,7 @@ static int psxpad_command(struct psxdriver *psx, const u8 sendcmdlen, u8 pin_num
 
                 mtap = 1;
         }
-	if(mode == read_mode)
+	if(mode == read_mode && psx->pads[pin_num][0] != NULL)
 	{
 		psx->sendbuf[3] = psx->pads[pin_num][0]->motor1enable ? psx->pads[pin_num][0]->motor1level : 0x00;
 	        psx->sendbuf[4] = psx->pads[pin_num][0]->motor2enable ? psx->pads[pin_num][0]->motor2level : 0x00;
@@ -231,11 +250,12 @@ static int psxpad_command(struct psxdriver *psx, const u8 sendcmdlen, u8 pin_num
 
         if(mtap)
         {
+		PSX_ACK_OR_DIE;
 		if(sendcmdlen <= 8) // if the user only supplied 8 command bytes, repeat them for the other controllers on the multitap
 		{
 			for(index = 1; index < 4; index++)
 			{
-				if(mode == read_mode)
+				if(mode == read_mode && psx->pads[pin_num][index] != NULL)
 			        {
 			                psx->sendbuf[3] = psx->pads[pin_num][index]->motor1enable ? psx->pads[pin_num][index]->motor1level : 0x00;
         			        psx->sendbuf[4] = psx->pads[pin_num][index]->motor2enable ? psx->pads[pin_num][index]->motor2level : 0x00;
@@ -248,11 +268,12 @@ static int psxpad_command(struct psxdriver *psx, const u8 sendcmdlen, u8 pin_num
 		}
 		else
 		{
-			psx_xmit(psx->spi, psx->sendbuf + 8, psx->response + numBytesRecvd, sendcmdlen - 8, 0);
+			psx_xmit(psx->spi, psx->sendbuf + 8, psx->response + numBytesRecvd, sendcmdlen - 8, 2000000);
 	                numBytesRecvd += (sendcmdlen - 8);
 		}
         }
         GPIO_SET = pin;
+	local_irq_restore(flags);
 	return numBytesRecvd;
 }
 
@@ -362,67 +383,69 @@ static int psxpad_create_dev(struct psxdriver *psxdriver, int pin_num, int pad_n
 	struct input_dev *dev;
 	int i;
 	int err;
-	if(psxdriver->pads[pin_num][pad_num]) return -EINVAL;
-
 	//if (pad_type < 1 || pad_type >= GC_MAX) {
 	//	pr_err("Pad type %d unknown\n", pad_type);
 	//	return -EINVAL;
 	//}
 
-	psxdriver->pads[pin_num][pad_num] = kzalloc(sizeof(struct psxpad), GFP_KERNEL);
-
-	dev = input_allocate_device();
-	if (!dev) {
-		pr_err("Not enough memory for input device\n");
-		return -ENOMEM;
+	if(!psxdriver->pads[pin_num][pad_num]) {
+		psxdriver->pads[pin_num][pad_num] = kzalloc(sizeof(struct psxpad), GFP_KERNEL);
 	}
 
-	dev->name = psx_name;
-	snprintf(psxdriver->pads[pin_num][pad_num]->phys, 0x20,
-		"psxpad_%d_%d", pin_num, pad_num);
-	dev->phys = psxdriver->pads[pin_num][pad_num]->phys;
-	dev->id.bustype = BUS_PARPORT;
-	dev->id.vendor = 0x0001;
-	dev->id.product = pad_type;
-	dev->id.version = 0x0100;
+	if(!psxdriver->pads[pin_num][pad_num]->dev) {
+		dev = input_allocate_device();
+		if (!dev) {
+			pr_err("Not enough memory for input device\n");
+			return -ENOMEM;
+		}
 
-	input_set_drvdata(dev, psxdriver);
+		dev->name = psx_name;
+		snprintf(psxdriver->pads[pin_num][pad_num]->phys, 0x20,
+			"psxpad_%d_%d", pin_num, pad_num);
+		dev->phys = psxdriver->pads[pin_num][pad_num]->phys;
+		dev->id.bustype = BUS_SPI;
+		dev->id.vendor = 0x0001;
+		dev->id.product = pad_type;
+		dev->id.version = 0x0100;
 
-	dev->open = psx_open;
-	dev->close = psx_close;
+		input_set_drvdata(dev, psxdriver);
 
-	dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
+		dev->open = psx_open;
+		dev->close = psx_close;
 
-	input_set_abs_params(dev, ABS_HAT0X, -1, 1, 0, 0);
-	input_set_abs_params(dev, ABS_HAT0Y, -1, 1, 0, 0);
+		dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
 
-	for (i = 0; i < 4; i++) {
-		input_set_abs_params(dev, psx_abs[i], 0, 255, 0, 28);
+		input_set_abs_params(dev, ABS_HAT0X, -1, 1, 0, 0);
+		input_set_abs_params(dev, ABS_HAT0Y, -1, 1, 0, 0);
+
+		for (i = 0; i < 4; i++) {
+			input_set_abs_params(dev, psx_abs[i], 0, 255, 0, 28);
+		}
+		for (i = 0; i < 12; i++) {
+			__set_bit(psx_btn[i], dev->keybit);
+		}
+		input_set_capability(dev, EV_FF, FF_RUMBLE);
+
+        	err = input_ff_create_memless(dev, NULL, psxpad_spi_play_effect);
+	        if (err) {
+			input_free_device(dev);
+	                kfree(psxdriver->pads[pin_num][pad_num]);
+			printk(KERN_ERR "Failed to create memless force-feedback for input device for controller on pin %d, port %d\n", pin_num, pad_num); 
+		        return err;
+	        }
+		psxdriver->pads[pin_num][pad_num]->dev = dev;
 	}
-	for (i = 0; i < 12; i++) {
-		__set_bit(psx_btn[i], dev->keybit);
+
+	if(!psxdriver->pads[pin_num][pad_num]->dev_reg) {
+		err = input_register_device(dev);
+		if(err) {
+			input_free_device(dev);
+			psxdriver->pads[pin_num][pad_num]->dev = NULL;
+			printk(KERN_ERR "Failed to register input device for controller on pin %d, port %d\n", pin_num, pad_num);
+			return err;
+		}
+		psxdriver->pads[pin_num][pad_num]->dev_reg = 1;
 	}
-
-	psxdriver->pads[pin_num][pad_num]->dev = dev;
-
-	err = input_register_device(dev);
-	if(err)
-	{
-		input_free_device(dev);
-		kfree(psxdriver->pads[pin_num][pad_num]);
-		printk(KERN_ERR "Failed to register input device for controller on pin %d, port %d\n", pin_num, pad_num);
-		return err;
-	}
-
-	//input_set_capability(dev, EV_FF, FF_RUMBLE);
-
-        //err = input_ff_create_memless(dev, NULL, psxpad_spi_play_effect);
-        //if (err) {
-	//	input_free_device(dev);
-          //      kfree(psxdriver->pads[pin_num][pad_num]);
-	//	printk(KERN_ERR "Failed to create memless force-feedback for input device for controller on pin %d, port %d\n", pin_num, pad_num); 
-//	        return err;
-  //      }
 
 	printk(KERN_INFO "psxpad_spi_ex: created device for controller on pin %d, port %d\n", pin_num, pad_num);
 
@@ -431,20 +454,17 @@ static int psxpad_create_dev(struct psxdriver *psxdriver, int pin_num, int pad_n
 
 static int psxpad_destroy_dev(struct psxdriver *psxdriver, int pin_num, int pad_num)
 {
+	if(!psxdriver->pads[pin_num][pad_num]) return -EINVAL;
+
         struct input_dev *dev = psxdriver->pads[pin_num][pad_num]->dev;
 
         if(!dev) return -EINVAL;
 
-	input_unregister_device(dev);
-
-	input_free_device(dev);
-
-	kfree(psxdriver->pads[pin_num][pad_num]);
-
-	psxdriver->pads[pin_num][pad_num] = NULL;
-
+	if(psxdriver->pads[pin_num][pad_num]->dev_reg) {
+		input_unregister_device(dev);
+		psxdriver->pads[pin_num][pad_num]->dev_reg = 0;
+	}
 	printk(KERN_INFO "psxpad_spi_ex: deleted controller on pin %d, port %d\n", pin_num, pad_num);
-
 
 	return 0;
 }
@@ -514,6 +534,11 @@ static void psxpad_report(struct psxpad *pad, u8 pad_type, u8 *data)
 #ifdef HAVE_TIMER_SETUP
 static void psx_timer(struct timer_list *t)
 {
+	if(!t)
+	{
+		printk(KERN_ERR "psxpad_spi_ex: timer_list was null in timer!\n");
+		return;
+	}
 	struct psxdriver *psx = from_timer(psx, t, timer);
 #else
 static void psx_timer(unsigned long private)
@@ -523,9 +548,12 @@ static void psx_timer(unsigned long private)
 	if(!psx)
 	{
 		printk(KERN_ERR "psxpad_spi_ex: psx struct was null in timer!\n");
+		return;
 	}
-	/*
-	u8 pin_num, pad_num, pads_added, index, err;
+
+
+	u8 pin_num, pad_num, pads_added, index;
+	int err;
 	for(pin_num = 0; pin_num < 2; pin_num++)
 	{
 	        memcpy(psx->sendbuf, PSX_CMD_POLL, sizeof(PSX_CMD_POLL));
@@ -535,6 +563,7 @@ static void psx_timer(unsigned long private)
 	                        "%s: poll command failed mode: %d\n", __func__, err);
 	                return;
 	        }
+
 		if(err == 0) { // no bytes received or ACK fail
 			psxpad_destroy_dev(psx, pin_num, 0);
 			psxpad_destroy_dev(psx, pin_num, 1);
@@ -551,42 +580,47 @@ static void psx_timer(unsigned long private)
 						}
 						psxpad_report(psx->pads[pin_num][pad_num], psx->response[index], psx->response + index + 2);
 					}
-					else psxpad_destroy_dev(psx, pin_num, 0);
+					else psxpad_destroy_dev(psx, pin_num, pad_num);
 				}
 			}
 			else { // if there's no multitap but we've gotten data, there must be valid data there
 				if(psxpad_create_dev(psx, pin_num, 0, psx->response[1]) == 0) pads_added++;
 
-				psxpad_report(psx->pads[pin_num][pad_num], psx->response[1], psx->response + 3);
+				psxpad_report(psx->pads[pin_num][0], psx->response[1], psx->response + 3);
 			}
 			if(pads_added) {
 				psxpad_control_motor(psx, pin_num, true, true);
 			}
 		}
 
+
 	}
-	*/
+
 	mod_timer(&psx->timer, jiffies + PSX_REFRESH_TIME);
+
 }
 
 static int psxpad_spi_probe(struct spi_device *spi)
 {
-	if(psx_base != NULL)
-	{
-		pr_err("psxpad_spi_ex: PSX struct alread alloc'd! Confused, exiting.\n");
-		return -EINVAL;
-	}
 	struct psxdriver *psxdriver;
 
 	/* Set up gpio pointer for direct register access */
-   	if ((gpio = ioremap(GPIO_BASE, 0xB0)) == NULL) {
-   	   	pr_err("io remap failed\n");
-   	   	return -EBUSY;
-   	}
+ 	if(gpio == NULL) {
+		if ((gpio = ioremap(GPIO_BASE, 0xB0)) == NULL) {
+   		   	pr_err("io remap failed\n");
+	   	   	return -EBUSY;
+	   	}
 
-	*(gpio+(PSX_GPIO_ACK/10)) &= ~(7<<((PSX_GPIO_ACK%10)*3)); // ACK pin to input
-	*(gpio+(PSX_GPIO_ATT1/10)) |= (1<<((PSX_GPIO_ATT1%10)*3)); // ATT1 (chip enable 0) to output
-	*(gpio+(PSX_GPIO_ATT2/10)) |= (1<<((PSX_GPIO_ATT2%10)*3)); // ATT2 (chip enable 1) to output
+		*(gpio+(PSX_GPIO_ACK/10)) &= ~(7<<((PSX_GPIO_ACK%10)*3)); // ACK pin to input
+
+		*(gpio+(PSX_GPIO_ATT1/10)) &= ~(7<<((PSX_GPIO_ATT1%10)*3));
+		*(gpio+(PSX_GPIO_ATT1/10)) |= (1<<((PSX_GPIO_ATT1%10)*3)); // ATT1 (chip enable 0) to output
+
+		*(gpio+(PSX_GPIO_ATT2/10)) &= ~(7<<((PSX_GPIO_ATT2%10)*3));
+		*(gpio+(PSX_GPIO_ATT2/10)) |= (1<<((PSX_GPIO_ATT2%10)*3)); // ATT2 (chip enable 1) to output
+
+		GPIO_SET = (1<<PSX_GPIO_ATT1) | (1<<PSX_GPIO_ATT2);
+	}
 
 	psxdriver = devm_kzalloc(&spi->dev, sizeof(struct psxdriver), GFP_KERNEL);
 
@@ -610,18 +644,16 @@ static int psxpad_spi_probe(struct spi_device *spi)
 
 	pm_runtime_enable(&spi->dev);
 
-	psx_base = psxdriver;
-
 	mod_timer(&psxdriver->timer, jiffies + PSX_REFRESH_TIME);
 
-	printk(KERN_INFO "psxpad_spi_ex: listening for controllers.\n");
+	printk(KERN_INFO "psxpad_spi_ex: listening for controllers on %s.\n", dev_name(&spi->dev));
 
 	return 0;
 }
 
 static void psxpad_shutdown(struct spi_device *spi)
 {
-	printk(KERN_INFO "psxpad_spi_ex: shutting down.\n");
+	//printk(KERN_INFO "psxpad_spi_ex: shutting down.\n");
 	struct psxdriver *psx = spi_get_drvdata(spi);
 	int pin_num, pad_num;
 	if(psx)
@@ -636,7 +668,10 @@ static void psxpad_shutdown(struct spi_device *spi)
 	        }
 		kfree(psx);
 	}
-	if(gpio) iounmap(gpio);
+	if(gpio) {
+		iounmap(gpio);
+		gpio = NULL;
+	}
 }
 
 static int __maybe_unused psxpad_spi_suspend(struct device *dev)
@@ -648,7 +683,7 @@ static int __maybe_unused psxpad_spi_suspend(struct device *dev)
 	{
 		for(pad_num = 0; pad_num < 4; pad_num++)
 		{
-			psxpad_set_motor_level(psx->pads[pin_num][pad_num], 0, 0);
+			if(psx->pads[pin_num][pad_num]) psxpad_set_motor_level(psx->pads[pin_num][pad_num], 0, 0);
 		}
 	}
 	return 0;
@@ -671,21 +706,7 @@ static struct spi_driver psxpad_spi_driver = {
 	.probe   = psxpad_spi_probe,
 	.shutdown = psxpad_shutdown
 };
-/*
-static int __init psxpad_init(void)
-{
-	int ret = 0;
-	ret = spi_register_driver(&(psxpad_spi_driver));
-	printk("psxpad: spi_register_driver returned %d\n", ret);
-	return ret;
-}
-module_init(psxpad_init);
-static void __exit psxpad_exit(void)
-{
-	spi_unregister_driver(&(psxpad_spi_driver));
-}
-module_exit(psxpad_exit);
-*/
+
 module_spi_driver(psxpad_spi_driver);
 
 MODULE_AUTHOR("Katie McKean <mckeanke@msu.edu>");
