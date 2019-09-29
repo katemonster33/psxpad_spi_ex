@@ -657,14 +657,14 @@ static int __maybe_unused psxpad_spi_suspend(struct device *dev)
 static SIMPLE_DEV_PM_OPS(psxpad_spi_pm, psxpad_spi_suspend, NULL);
 
 static const struct spi_device_id psxpad_spi_id[] = {
-	{ "spidev", 0 },
+	{ "psxpad-spi", 0 },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, psxpad_spi_id);
 
 static struct spi_driver psxpad_spi_driver = {
 	.driver = {
-		.name = "spidev",
+		.name = "psxpad-spi",
 		.pm = &psxpad_spi_pm,
 	},
 	.id_table = psxpad_spi_id,
