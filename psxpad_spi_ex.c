@@ -13,10 +13,10 @@
  * 3: 9V (for motor, if not use N.C.)
  * 4: GND
  * 5: 3.3V
- * 6: Attention -> CS(SS)
+ * 6: Attention -> CS(CE0 or CE1 for controller port 1/2)
  * 7: SCK -> SCK
  * 8: N.C.
- * 9: ACK -> N.C.
+ * 9: ACK -> N.C. or GPIO25 (pullup with 1kohm to 3.3V)
  */
 
 #include <linux/kernel.h>
@@ -29,6 +29,10 @@
 #include <linux/types.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/kthread.h>
+#include <linux/sched.h>
+#include <linux/time.h>
+
 /*
 #ifdef CONFIG_ARCH_MULTI_V7
 #define BCM2708_PERI_BASE 0x3F000000
@@ -53,13 +57,14 @@
 	(((x) & 0x20) >> 3) | (((x) & 0x10) >> 1) | (((x) & 0x08) << 1) | \
 	(((x) & 0x04) << 3) | (((x) & 0x02) << 5) | (((x) & 0x01) << 7))
 
-#define PSX_ACK_OR_DIE if(!psxpad_wait_ack()) { GPIO_SET = pin; udelay(40); return 0; }
-
 #define PSX_GPIO_ACK 25
 #define PSX_GPIO_ATT1 23
 #define PSX_GPIO_ATT2 24
 
 static const char *psx_name = "PSX controller";
+
+const u8 wakeup = 0x80;//0x01;
+const u8 read_mode = 0x42;
 
 #define PSX_REFRESH_TIME	HZ/60
 
@@ -95,13 +100,20 @@ struct psxpad {
 };
 
 struct psxdriver {
-	struct spi_device *spi;
+	struct spi_device *spis[2];
+	struct spi_device *cur_spi;
 	struct psxpad* pads[2][4];
+	u8 mtaps[2];
 	struct timer_list timer;
+	u8 *cur_send_byte;
+	u8 *last_send_byte;
+	struct task_struct *thread;
+	u8 stop_thread;
 	u8 sendbuf[50] ____cacheline_aligned;
 	u8 response[50] ____cacheline_aligned;
 };
 
+static volatile struct psxdriver *psx_base = NULL;
 static volatile unsigned *gpio = NULL;
 
 /*
@@ -109,31 +121,24 @@ static volatile unsigned *gpio = NULL;
  *  should be sent using this call unless transmitting at 1 Mhz, because the inter-byte delay is not enough
  *  time for the controller to recover and be ready for the next byte.
  */
-static int psx_xmit(struct spi_device *spi, const u8 *inBytes, u8 *outBytes, u8 len, u32 baud_override)
+static int psx_xmit(struct spi_device *spi, struct spi_transfer *xfers, const u8 *inBytes, u8 *outBytes, u8 len)
 {
-	struct spi_transfer xfers = {
-                .tx_buf         = inBytes,
-                .rx_buf         = outBytes,
-                .len            = len,
-                .speed_hz       = baud_override,
-		.delay_usecs	= 0
-        };
-        int err;
+    int err;
 	u8 index;
+	xfers->tx_buf         = inBytes;
+    xfers->rx_buf         = outBytes;
+    xfers->len            = len;
 
-        err = spi_sync_transfer(spi, &xfers, 1);
-        if (err) {
-                dev_err(&spi->dev,
-                        "%s: failed to SPI xfers mode: %d\n",
-                        __func__, err);
-                return err;
-        }
-        for(index = 0; index < len; index++)
-        {
-                outBytes[index] = REVERSE_BIT(outBytes[index]);
-        }
+    err = spi_sync_transfer(spi, xfers, 1);
+    if (err) {
+        dev_err(&spi->dev, "%s: failed to SPI xfers mode: %d\n", __func__, err);
+        return err;
+    }
+    for(index = 0; index < len; index++) {
+        outBytes[index] = REVERSE_BIT(outBytes[index]);
+    }
 
-        return 0;
+    return 0;
 }
 
 /*
@@ -144,135 +149,124 @@ static int psx_xmit(struct spi_device *spi, const u8 *inBytes, u8 *outBytes, u8 
  */
 static int psxpad_wait_ack(void)
 {
-        int i;
-        for(i = 0; i < 50; i++)
+    struct timeval cur_time, start;
+	long usec_elapsed;
+    do_gettimeofday(&start);
+	do
+    {
+        if(!(GPIO_STATUS & (1 << PSX_GPIO_ACK)))
         {
-                udelay(1);
-                if(!(GPIO_STATUS & (1 << PSX_GPIO_ACK)))
-                {
-                        udelay(6); /* sleep for one clock cycle to let controller settle */
-                        return 1;
-                }
+        	/* sleep at least one clock cycle to make sure controller settles before we return, but we still need to hit >50 us total */
+        	if(usec_elapsed > 44) udelay(6);
+        	else udelay(50 - usec_elapsed);
+        	return 1;
         }
-        return 0;
+        do_gettimeofday(&cur_time);
+        usec_elapsed = cur_time.tv_usec - start.tv_usec;
+    }
+    while(usec_elapsed < 50);
+    return 0;
 }
 
 /*
  * psxpad_command() is the main function for sending a message to the PSX controller/multitap. In normal SPI
  *  the number of bytes sent dictate the number of bytes received, but PSX controllers require some dynamic
  *  handling. The digital controller returns less bytes than the analog for instance. If the multitap is
- *  connected, then it returns 35 bytes, and switches back and forth from 250khz to 1000khz.
+ *  connected, then it returns 35 bytes, and switches back and forth from 250 Khz to 1 Mhz.
  *
  * returns 0 for no controller connected, >0 for the number of bytes received, or <0 for SPI errors.
  */
 static int psxpad_command(struct psxdriver *psx, const u8 sendcmdlen, u8 pin_num)
 {
+	struct spi_transfer xfer;
 	unsigned long flags;
-        int numBytesRecvd = 0;
+    int numBytesRecvd = 0;
 	u8 num_pad_bytes = 8;
-	int mtap;
-	u8 ack_seen = 0;
-        u8 mode = 0;
-        const u8 wakeup = 0x80;//0x01;
-        const u8 read_mode = 0x42;
-	u8 index = 0;
-        int pin = 1 << (pin_num == 0 ? PSX_GPIO_ATT1 : PSX_GPIO_ATT2);
-        if(!sendcmdlen)
-                return 0;
+	u8 mode = 0, index = 0;
+    int pin = 1 << (pin_num == 0 ? PSX_GPIO_ATT1 : PSX_GPIO_ATT2);
+    if(!sendcmdlen)
+        return 0;
 	local_irq_save(flags);
 
-        mode = psx->sendbuf[0];
-        GPIO_CLR = pin;
+	mode = psx->sendbuf[0];
+	GPIO_CLR = pin;
 
-        udelay(100); // waiting 100 us after pulling ATT low is key to multitap support
-
-        if(psx_xmit(psx->spi, &wakeup, psx->response, 1, 0))
-        {
-                GPIO_SET = pin;
+	memset(&xfer, 0, sizeof(struct spi_transfer));
+	xfer.delay_usecs = 0;
+	xfer.speed_hz = 0;
+	udelay(70); // waiting 100 us after pulling ATT low is key to multitap support
+	
+	if(psx_xmit(psx->spis[pin_num], &xfer, &wakeup, psx->response, 1) || !psxpad_wait_ack())
+	{
+	    GPIO_SET = pin;
 		local_irq_restore(flags);
-                return -1;
-        }
-	for(index = 0; index < 50; index++)
-        {
-                udelay(1);
-                if(!(GPIO_STATUS & (1 << PSX_GPIO_ACK)))
-                {
-			ack_seen = 1; // saw ack... keep waiting though. need to wait 50 us
-                }
-        }
-
-        numBytesRecvd++;
-        psx_xmit(psx->spi, psx->sendbuf, psx->response + numBytesRecvd, 1, 0);
-        numBytesRecvd++;
+	    return -1;
+	}
+		
+	numBytesRecvd++;
+	xfer.delay_usecs = 5;
+	psx_xmit(psx->spis[pin_num], &xfer, psx->sendbuf, psx->response + numBytesRecvd, 1);
+	numBytesRecvd++;
 	if(psx->response[1] == 0xFF)
 	{
 		local_irq_restore(flags);
 		return 0;
 	}
 
-        if(psx->response[1] == 0x80) // multitap
+	if(psx->response[1] == 0x80) // multitap
+	{
+		xfer.delay_usecs = 2;
+		xfer.speed_hz = 2000000;
+        if(psx_xmit(psx->spis[pin_num], &xfer, &wakeup, psx->response + numBytesRecvd, 1))
         {
-		PSX_ACK_OR_DIE;
-                if(psx_xmit(psx->spi, &wakeup, psx->response + numBytesRecvd, 1, 2000000))
-                {
-                        GPIO_SET = pin;
+            GPIO_SET = pin;
 			local_irq_restore(flags);
 			return -1;
-                }
-		PSX_ACK_OR_DIE;
-
-                numBytesRecvd++;
-
-                if(mode != read_mode && !psx->pads[pin_num][0])
-                {
-                        psx_xmit(psx->spi, &read_mode, psx->response + numBytesRecvd, 1, 0);
-                }
-                else psx_xmit(psx->spi, psx->sendbuf, psx->response + numBytesRecvd, 1, 0);
-                numBytesRecvd++;
-
-                mtap = 1;
         }
+	
+        numBytesRecvd++;
+
+		xfer.delay_usecs = 3;
+		xfer.speed_hz = 0; // back to default rate
+        psx_xmit(psx->spis[pin_num], &xfer, psx->sendbuf, psx->response + numBytesRecvd, 1);
+        numBytesRecvd++;
+	}
+	psx->mtaps[pin_num] = psx->response[1] == 0x80;
 	if(mode == read_mode && psx->pads[pin_num][0] != NULL)
 	{
 		psx->sendbuf[3] = psx->pads[pin_num][0]->motor1enable ? psx->pads[pin_num][0]->motor1level : 0x00;
-	        psx->sendbuf[4] = psx->pads[pin_num][0]->motor2enable ? psx->pads[pin_num][0]->motor2level : 0x00;
+        psx->sendbuf[4] = psx->pads[pin_num][0]->motor2enable ? psx->pads[pin_num][0]->motor2level : 0x00;
 	}
-	if(!mtap)
+	if(psx->response[1] != 0x80)
 	{
 		num_pad_bytes = 2 * (psx->response[1] & 0x0F) + 1;
 	}
-        for(index = 1; index < num_pad_bytes; index++)
-        {
-		PSX_ACK_OR_DIE;
-                psx_xmit(psx->spi, psx->sendbuf + index, psx->response + numBytesRecvd, 1, 0);
-                numBytesRecvd ++;
-        }
+	xfer.delay_usecs = 0;
+    for(index = 1; index < num_pad_bytes; index++)
+    {
+        psx_xmit(psx->spis[pin_num], &xfer, psx->sendbuf + index, psx->response + numBytesRecvd, 1);
+        numBytesRecvd ++;
+    }
 
-        if(mtap)
-        {
-		PSX_ACK_OR_DIE;
+    if(psx->response[1] == 0x80)
+    {
+    	xfer.delay_usecs = 0;
+        xfer.speed_hz = 2000000;
 		if(sendcmdlen <= 8) // if the user only supplied 8 command bytes, repeat them for the other controllers on the multitap
 		{
 			for(index = 1; index < 4; index++)
 			{
-				if(mode == read_mode && psx->pads[pin_num][index] != NULL)
-			        {
-			                psx->sendbuf[3] = psx->pads[pin_num][index]->motor1enable ? psx->pads[pin_num][index]->motor1level : 0x00;
-        			        psx->sendbuf[4] = psx->pads[pin_num][index]->motor2enable ? psx->pads[pin_num][index]->motor2level : 0x00;
-			        }
-				if(psx->pads[pin_num][index]) psx->sendbuf[0] = mode;
-				else psx->sendbuf[0] = read_mode;
-		                psx_xmit(psx->spi, psx->sendbuf, psx->response + numBytesRecvd, 8, 2000000);
-	        	        numBytesRecvd += 8;
+                psx_xmit(psx->spis[pin_num], &xfer, psx->sendbuf, psx->response + numBytesRecvd, 8);
+       	        numBytesRecvd += 8;
 			}
 		}
 		else
 		{
-			psx_xmit(psx->spi, psx->sendbuf + 8, psx->response + numBytesRecvd, sendcmdlen - 8, 2000000);
-	                numBytesRecvd += (sendcmdlen - 8);
+			psx_xmit(psx->spis[pin_num], &xfer, psx->sendbuf + 8, psx->response + numBytesRecvd, sendcmdlen - 8);
+            numBytesRecvd += (sendcmdlen - 8);
 		}
-        }
-        GPIO_SET = pin;
+    }
+    GPIO_SET = pin;
 	local_irq_restore(flags);
 	return numBytesRecvd;
 }
@@ -294,46 +288,49 @@ static const short psx_btn[] = {
 	BTN_SELECT, BTN_THUMBL, BTN_THUMBR, BTN_START
 };
 
-
 #ifdef CONFIG_JOYSTICK_PSXPAD_SPI_FF
 static void psxpad_control_motor(struct psxdriver* psx, u8 pin_num,
 	bool motor1enable, bool motor2enable)
 {
 	int err;
 	u8 pad_num = 0;
+	u8 len = 8;
+	u8 offset = 0;
+	struct psxpad *pad;
+	const u8* messages[] = { PSX_CMD_ENTER_CFG, PSX_CMD_ENABLE_MOTOR, PSX_CMD_EXIT_CFG };
+	u8 message_index = 0;
 	for(pad_num = 0; pad_num < 3; pad_num++)
 	{
-		struct psxpad *pad = psx->pads[pin_num][pad_num];
+		pad = psx->pads[pin_num][pad_num];
 
 		pad->motor1enable = motor1enable;
 		pad->motor2enable = motor2enable;
 	}
-
-	memcpy(psx->sendbuf, PSX_CMD_ENTER_CFG, sizeof(PSX_CMD_ENTER_CFG));
-	err = psxpad_command(psx, sizeof(PSX_CMD_ENTER_CFG), pin_num);
-	if (err < 0) {
-		dev_err(&psx->spi->dev,
-			"%s: failed to enter config mode: %d\n",
-			__func__, err);
-		return;
-	}
-	memcpy(psx->sendbuf, PSX_CMD_ENABLE_MOTOR, sizeof(PSX_CMD_ENABLE_MOTOR));
-	psx->sendbuf[3] = motor1enable ? 0x00 : 0xFF;
-	psx->sendbuf[4] = motor2enable ? 0x80 : 0xFF;
-	err = psxpad_command(psx, sizeof(PSX_CMD_ENABLE_MOTOR), pin_num);
-	if (err < 0) {
-		dev_err(&psx->spi->dev,
-			"%s: failed to enable motor mode: %d\n",
-			__func__, err);
-		return;
-	}
-	memcpy(psx->sendbuf, PSX_CMD_EXIT_CFG, sizeof(PSX_CMD_EXIT_CFG));
-	err = psxpad_command(psx, sizeof(PSX_CMD_EXIT_CFG), pin_num);
-	if (err < 0) {
-		dev_err(&psx->spi->dev,
-			"%s: failed to exit config mode: %d\n",
-			__func__, err);
-		return;
+	for(message_index = 0; message_index < 3; message_index++) {
+		if(message_index != 0) udelay(500);
+		
+		if(psx->mtaps[pin_num])	{
+			len = 32;
+			for(pad_num = 0, offset = 0; pad_num < 3; pad_num++, offset += 8) {
+				pad = psx->pads[pin_num][pad_num];
+				if(pad->type != 0xFF) {
+					memcpy(psx->sendbuf + offset, messages[message_index], 8);
+					if(message_index == 1) {
+							psx->sendbuf[offset + 3] = motor1enable ? 0x00 : 0xFF;
+							psx->sendbuf[offset + 4] = motor2enable ? 0x80 : 0xFF;
+					}
+				}
+				else memcpy(psx->sendbuf + offset, PSX_CMD_POLL, 8);
+			}
+		}
+		else {
+			memcpy(psx->sendbuf + offset, messages[message_index], 8);
+		}
+		err = psxpad_command(psx, len, pin_num);
+		if (err < 0) {
+			dev_err(&psx->spis[pin_num]->dev, "psxpad_spi_ex(%s): failed to enable motor control: %d\n", __func__, err);
+			return;
+		}
 	}
 }
 
@@ -429,7 +426,7 @@ static int psxpad_create_dev(struct psxdriver *psxdriver, int pin_num, int pad_n
         	err = input_ff_create_memless(dev, NULL, psxpad_spi_play_effect);
 	        if (err) {
 			input_free_device(dev);
-	                kfree(psxdriver->pads[pin_num][pad_num]);
+            kfree(psxdriver->pads[pin_num][pad_num]);
 			printk(KERN_ERR "Failed to create memless force-feedback for input device for controller on pin %d, port %d\n", pin_num, pad_num); 
 		        return err;
 	        }
@@ -454,11 +451,12 @@ static int psxpad_create_dev(struct psxdriver *psxdriver, int pin_num, int pad_n
 
 static int psxpad_destroy_dev(struct psxdriver *psxdriver, int pin_num, int pad_num)
 {
+	struct input_dev *dev;
 	if(!psxdriver->pads[pin_num][pad_num]) return -EINVAL;
 
-        struct input_dev *dev = psxdriver->pads[pin_num][pad_num]->dev;
+    dev = psxdriver->pads[pin_num][pad_num]->dev;
 
-        if(!dev) return -EINVAL;
+    if(!dev) return -EINVAL;
 
 	if(psxdriver->pads[pin_num][pad_num]->dev_reg) {
 		input_unregister_device(dev);
@@ -476,7 +474,7 @@ static void psxpad_report(struct psxpad *pad, u8 pad_type, u8 *data)
 
         switch (pad_type) {
         case 0x73: // analog
-	case 0xF3: // dualshock 2 native
+		case 0xF3: // dualshock 2 native
                 input_report_key(dev, BTN_THUMBL, ~data[0] & 0x02);
                 input_report_key(dev, BTN_THUMBR, ~data[0] & 0x04);
 
@@ -507,7 +505,7 @@ static void psxpad_report(struct psxpad *pad, u8 pad_type, u8 *data)
                 /*
                  * For some reason if the extra axes are left unset
                  * they drift.
-	         */
+	         	 */
                 for (i = 0; i < 4; i++)
                 	input_report_abs(dev, psx_abs[i + 2], 128);
                 /* This needs to be debugged properly,
@@ -531,19 +529,86 @@ static void psxpad_report(struct psxpad *pad, u8 pad_type, u8 *data)
         }
 }
 
+static int psxpad_read_pads(void* args)
+{
+	struct psxdriver *psx = args;
+	while(!psx->stop_thread){
+		u8 pin_num, pad_num, pads_added, index, len, offset = 0;
+		int err;
+		
+		for(pin_num = 0; pin_num < 2; pin_num++) {
+		        if(psx->mtaps[pin_num]) {
+		        	
+	    			len = 32;
+	    			for(pad_num = 0, offset = 0; pad_num < 4; pad_num++, offset += 8){
+	    				memcpy(psx->sendbuf + offset, PSX_CMD_POLL, sizeof(PSX_CMD_POLL));
+	    				
+	    				psx->sendbuf[offset + 3] = psx->pads[pin_num][pad_num]->motor1level;
+	    				psx->sendbuf[offset + 4] = psx->pads[pin_num][pad_num]->motor2level;
+	    			}
+		        }
+		        else {
+		        	len = (2 * psx->pads[pin_num][pad_num]->type) + 1;
+		        	
+					memcpy(psx->sendbuf, PSX_CMD_POLL, sizeof(PSX_CMD_POLL));
+		        }
+		        err = psxpad_command(psx, len, pin_num);
+		        if (err < 0) {
+		                dev_err(&psx->spis[pin_num]->dev, "%s: poll command failed mode: %d\n", __func__, err);
+		                return -1;
+		        }
+	
+			if(err == 0) { // no bytes received or ACK fail
+				psxpad_destroy_dev(psx, pin_num, 0);
+				psxpad_destroy_dev(psx, pin_num, 1);
+				psxpad_destroy_dev(psx, pin_num, 2);
+				psxpad_destroy_dev(psx, pin_num, 3);
+			}
+			else {
+				pads_added = 0;
+				if(psx->sendbuf[1] & 0x80) {
+					for(index = 3, pad_num = 0; index < err; index += 8, pad_num++) {
+						if(psx->response[index] != 0 && psx->response[index] != 0xFF) {
+							if(psxpad_create_dev(psx, pin_num, pad_num, psx->response[index]) == 0) {
+								pads_added++;
+							}
+							psxpad_report(psx->pads[pin_num][pad_num], psx->response[index], psx->response + index + 2);
+						}
+						else psxpad_destroy_dev(psx, pin_num, pad_num);
+					}
+				}
+				else { // if there's no multitap but we've gotten data, there must be valid data there
+					if(psxpad_create_dev(psx, pin_num, 0, psx->response[1]) == 0) pads_added++;
+	
+					psxpad_report(psx->pads[pin_num][0], psx->response[1], psx->response + 3);
+				}
+				if(pads_added) {
+					psxpad_control_motor(psx, pin_num, true, true);
+				}
+			}
+		}
+		mdelay(10);
+	}
+	
+	return 0;
+}
+/*
 #ifdef HAVE_TIMER_SETUP
 static void psx_timer(struct timer_list *t)
 {
+	struct psxdriver *psx;
+	char *our_thread = "psx_thread";
 	if(!t)
 	{
 		printk(KERN_ERR "psxpad_spi_ex: timer_list was null in timer!\n");
 		return;
 	}
-	struct psxdriver *psx = from_timer(psx, t, timer);
+	psx = from_timer(psx, t, timer);
 #else
 static void psx_timer(unsigned long private)
 {
-	struct psxdriver *psx = (void *) private;
+	char *our_thread = "psx_thread";
+	psx = (void *) private;
 #endif
 	if(!psx)
 	{
@@ -551,59 +616,29 @@ static void psx_timer(unsigned long private)
 		return;
 	}
 
-
-	u8 pin_num, pad_num, pads_added, index;
-	int err;
-	for(pin_num = 0; pin_num < 2; pin_num++)
+	if(psx->thread)
 	{
-	        memcpy(psx->sendbuf, PSX_CMD_POLL, sizeof(PSX_CMD_POLL));
-	        err = psxpad_command(psx, sizeof(PSX_CMD_POLL), pin_num);
-	        if (err < 0) {
-	                dev_err(&psx->spi->dev,
-	                        "%s: poll command failed mode: %d\n", __func__, err);
-	                return;
-	        }
-
-		if(err == 0) { // no bytes received or ACK fail
-			psxpad_destroy_dev(psx, pin_num, 0);
-			psxpad_destroy_dev(psx, pin_num, 1);
-			psxpad_destroy_dev(psx, pin_num, 2);
-			psxpad_destroy_dev(psx, pin_num, 3);
-		}
-		else {
-			pads_added = 0;
-			if(psx->sendbuf[1] & 0x80) {
-				for(index = 3, pad_num = 0; index < err; index += 8, pad_num++) {
-					if(psx->response[index] != 0 && psx->response[index] != 0xFF) {
-						if(psxpad_create_dev(psx, pin_num, pad_num, psx->response[index]) == 0) {
-							pads_added++;
-						}
-						psxpad_report(psx->pads[pin_num][pad_num], psx->response[index], psx->response + index + 2);
-					}
-					else psxpad_destroy_dev(psx, pin_num, pad_num);
-				}
-			}
-			else { // if there's no multitap but we've gotten data, there must be valid data there
-				if(psxpad_create_dev(psx, pin_num, 0, psx->response[1]) == 0) pads_added++;
-
-				psxpad_report(psx->pads[pin_num][0], psx->response[1], psx->response + 3);
-			}
-			if(pads_added) {
-				psxpad_control_motor(psx, pin_num, true, true);
-			}
-		}
-
-
+		kthread_stop(psx->thread);
+		psx->thread = NULL;
 	}
 
-	mod_timer(&psx->timer, jiffies + PSX_REFRESH_TIME);
+	psx->thread = kthread_create(psxpad_read_pads, psx, our_thread);
 
+	//mod_timer(&psx->timer, jiffies + PSX_REFRESH_TIME);
 }
+*/
+void memset_volatile(volatile void *s, char c, size_t n)
+{
+    volatile char *p = s;
+    while (n-- > 0) {
+        *p++ = c;
+    }
+}
+   
 
 static int psxpad_spi_probe(struct spi_device *spi)
 {
-	struct psxdriver *psxdriver;
-
+	char *our_thread = "psx_thread";
 	/* Set up gpio pointer for direct register access */
  	if(gpio == NULL) {
 		if ((gpio = ioremap(GPIO_BASE, 0xB0)) == NULL) {
@@ -622,12 +657,34 @@ static int psxpad_spi_probe(struct spi_device *spi)
 		GPIO_SET = (1<<PSX_GPIO_ATT1) | (1<<PSX_GPIO_ATT2);
 	}
 
-	psxdriver = devm_kzalloc(&spi->dev, sizeof(struct psxdriver), GFP_KERNEL);
+	if(psx_base == NULL) {
+		psx_base = devm_kzalloc(&spi->dev, sizeof(struct psxdriver), GFP_KERNEL);
+		memset_volatile(psx_base, 0, sizeof(struct psxdriver));
 
-	if (!psxdriver)
-		return -ENOMEM;
+		if (!psx_base)
+			return -ENOMEM;
 
-	psxdriver->spi = spi;
+#ifdef HAVE_TIMER_SETUP
+		//timer_setup(&psx_base->timer, psx_timer, 0);
+#else
+		//setup_timer(&psx_base->timer, psx_timer, (long) psx_base);
+#endif
+
+		psx_base->spis[0] = spi;
+	}
+	else { // entered probe for second time
+		if(!psx_base->spis[0])
+		{
+			printk(KERN_ERR "psxpad_spi_ex: spis[0] was null! Cannot start timer.");
+			return -EINVAL;
+		}
+		psx_base->spis[1] = spi;
+
+		psx_base->stop_thread = 0;
+		psx_base->thread = kthread_create(psxpad_read_pads, psx_base, our_thread);
+		
+		//mod_timer(&psx_base->timer, jiffies + PSX_REFRESH_TIME);
+	}
 	/* SPI settings */
 	spi->mode = SPI_MODE_3;
 	spi->bits_per_word = 8;
@@ -636,15 +693,7 @@ static int psxpad_spi_probe(struct spi_device *spi)
 	spi->master->max_speed_hz = 500000;
 	spi_setup(spi);
 
-#ifdef HAVE_TIMER_SETUP
-	timer_setup(&psxdriver->timer, psx_timer, 0);
-#else
-	setup_timer(&psxdriver->timer, psx_timer, (long) gc);
-#endif
-
 	pm_runtime_enable(&spi->dev);
-
-	mod_timer(&psxdriver->timer, jiffies + PSX_REFRESH_TIME);
 
 	printk(KERN_INFO "psxpad_spi_ex: listening for controllers on %s.\n", dev_name(&spi->dev));
 
@@ -656,17 +705,20 @@ static void psxpad_shutdown(struct spi_device *spi)
 	//printk(KERN_INFO "psxpad_spi_ex: shutting down.\n");
 	struct psxdriver *psx = spi_get_drvdata(spi);
 	int pin_num, pad_num;
-	if(psx)
-	{
+	if(psx_base) {
 		del_timer(&psx->timer);
-		for(pin_num = 0; pin_num < 2; pin_num++)
-	       	{
-	               	for(pad_num = 0; pad_num < 4; pad_num++)
-	                {
+		for(pin_num = 0; pin_num < 2; pin_num++) {
+           	for(pad_num = 0; pad_num < 4; pad_num++) {
 				psxpad_destroy_dev(psx, pin_num, pad_num);
-	       	        }
-	        }
-		kfree(psx);
+   	        }
+       	}
+       	if(psx->thread) 
+       	{
+			psx_base->stop_thread = 1;
+       		kthread_stop(psx->thread);
+       		psx->thread = NULL;
+       	}
+		psx_base = NULL;
 	}
 	if(gpio) {
 		iounmap(gpio);
